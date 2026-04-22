@@ -1,7 +1,12 @@
 """Command-line chat for the microGPT teaching project."""
 
 import argparse
+import os
 import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 parser = argparse.ArgumentParser(description="Chat with a trained model")

@@ -7,26 +7,28 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from microchat.common import COMPUTE_DTYPE
 
 
+
 def norm(x):
+    # Use RMS norm for better stability with low-precision training.
     return F.rms_norm(x, (x.size(-1),))
 
 
 class Linear(nn.Linear):
     """Match weight dtype to activation dtype during forward."""
-
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype), self.bias)
 
 
 def has_ve(layer_idx, n_layer):
+    """ve = value embedding, an additional input to the attention mechanism. Only add it to some layers to save compute."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
 def apply_rotary_emb(x, cos, sin):
+    """旋转位置编码，将输入张量x的前半部分和后半部分分别乘以cos和sin，并进行旋转变换。"""
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     y1 = x1 * cos + x2 * sin
@@ -35,6 +37,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 def repeat_kv_heads(x, n_head):
+    """Repeat the key-value heads to match the number of attention heads."""
     if x.size(1) == n_head:
         return x
     repeat = n_head // x.size(1)
@@ -42,6 +45,8 @@ def repeat_kv_heads(x, n_head):
 
 
 def build_sliding_mask(query_positions, key_length, left_window, device):
+    """Build a sliding attention mask for the given query positions and key length.""" 
+    
     keys = torch.arange(key_length, device=device)
     allow = keys.unsqueeze(0) <= query_positions.unsqueeze(1)
     if left_window >= 0:

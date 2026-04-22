@@ -5,9 +5,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import os
+import sys
 import time
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 parser = argparse.ArgumentParser(description="Run supervised fine-tuning")
