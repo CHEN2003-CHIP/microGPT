@@ -14,6 +14,7 @@ from microchat.tokenizer import get_tokenizer
 
 
 def save_checkpoint(checkpoint_dir, step, model_state, metadata):
+    """Save a checkpoint consisting of the model state and associated metadata (e.g. config, training step)."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -24,6 +25,7 @@ def save_checkpoint(checkpoint_dir, step, model_state, metadata):
 
 
 def load_checkpoint(checkpoint_dir, step, device):
+    """Load a checkpoint by step number, returning the model state and associated metadata."""
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     model_state = torch.load(model_path, map_location=device)
@@ -33,6 +35,7 @@ def load_checkpoint(checkpoint_dir, step, device):
 
 
 def find_last_step(checkpoint_dir):
+    """Find the last training step in the checkpoint directory."""
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
@@ -40,6 +43,7 @@ def find_last_step(checkpoint_dir):
 
 
 def find_model_tag(checkpoints_dir, requested_tag=None):
+    """Find the model tag to load. If a specific tag is requested, return it if it exists. Otherwise, find the tag with the highest depth (dNNN) or the most recently modified tag."""
     if requested_tag is not None:
         return requested_tag
     model_tags = [name for name in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, name))]
@@ -57,6 +61,7 @@ def find_model_tag(checkpoints_dir, requested_tag=None):
 
 
 def build_model(checkpoint_dir, step, device, phase):
+    """Build the model by loading the checkpoint and applying the model state to a new model instance initialized with the config from the metadata."""
     model_state, metadata = load_checkpoint(checkpoint_dir, step, device)
     config = GPTConfig(**metadata["model_config"])
     with torch.device("meta"):
@@ -76,6 +81,7 @@ def build_model(checkpoint_dir, step, device, phase):
 
 
 def load_model(source, device, phase="eval", model_tag=None, step=None):
+    """Load a model checkpoint from the specified source ("base" or "sft"), returning the model, tokenizer, and metadata. If model_tag is not specified, find the most recent or deepest tag. If step is not specified, find the last step in the checkpoint directory."""
     checkpoints_root = {
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",

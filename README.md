@@ -139,6 +139,56 @@ Single-prompt example:
 uv run python scripts/chat_cli.py -i sft -g d4 -p "Introduce yourself."
 ```
 
+### 6. Run a chat evaluation benchmark
+
+After SFT, you can run a small rule-based benchmark that prints pass/fail results,
+computes an overall score, and writes Markdown plus JSON reports.
+
+```bash
+uv run python scripts/chat_eval.py -i sft -g d4
+```
+
+Default behavior:
+
+- Loads the latest checkpoint for the selected model tag
+- Uses `.microchat/chat_eval.jsonl` if present, otherwise falls back to `scripts/chat_eval.sample.jsonl`
+- Runs deterministic generation with `temperature=0`
+- Marks the model as `Qualified: YES/NO` using the overall pass threshold and required cases
+
+Useful flags:
+
+- `--eval-file`: custom benchmark JSONL path
+- `--pass-threshold`: global qualification line, default `0.8`
+- `--max-tokens`: cap response length during evaluation
+- `--report-dir`: where to write the `.md` and `.json` reports
+
+Example:
+
+```bash
+uv run python scripts/chat_eval.py -i sft -g d4 --pass-threshold 0.75 --max-tokens 96
+```
+
+Reports are written by default to:
+
+```text
+.microchat/reports/chat_eval/
+```
+
+Each JSONL benchmark row looks like this:
+
+```json
+{"id":"follow_instruction_cn","category":"instruction","required":true,"prompt":"只回复“苹果”，不要解释。","checks":{"exact":["苹果"]}}
+```
+
+Supported `checks` keys:
+
+- `exact`: response must exactly match one of the candidate strings
+- `contains_all`: every listed phrase must appear
+- `contains_any`: at least one listed phrase must appear
+- `regex_any`: at least one regex must match
+- `forbidden_contains`: none of these phrases may appear
+- `min_chars`: minimum response length
+
 ## Local Data and Artifact Directories
 
 By default, the project stores generated artifacts under:

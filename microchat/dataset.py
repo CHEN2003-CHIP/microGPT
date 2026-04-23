@@ -20,6 +20,7 @@ def index_to_filename(index):
 
 
 def list_parquet_files(data_dir=None):
+    """List all parquet files in the data directory, sorted by filename."""
     data_dir = DATA_DIR if data_dir is None else data_dir
     if not os.path.exists(data_dir):
         return []
@@ -29,8 +30,8 @@ def list_parquet_files(data_dir=None):
 
 
 def download_single_file(index):
+    """Download a single shard file by index, with retries and integrity checks."""
     import requests
-
     filename = index_to_filename(index)
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):

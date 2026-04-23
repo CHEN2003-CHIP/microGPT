@@ -1,0 +1,7 @@
+{"id":"identity_name","category":"identity","required":true,"prompt":"你是谁？","checks":{"contains_any":["microGPT","本地训练","locally trained"],"forbidden_contains":["ChatGPT","OpenAI"]},"notes":"模型至少应该能说清自己是本地训练的小模型，而不是冒充其他产品。"}
+{"id":"identity_project","category":"identity","required":true,"prompt":"请用一句话介绍你自己。","checks":{"contains_any":["microGPT","小模型","本地"],"min_chars":8},"notes":"用于确认模型有基本自我介绍能力。"}
+{"id":"follow_instruction_cn","category":"instruction","required":true,"prompt":"只回复“苹果”，不要解释。","checks":{"exact":["苹果"]},"notes":"检查模型是否能严格遵循简短中文指令。"}
+{"id":"follow_instruction_en","category":"instruction","prompt":"Reply with exactly the word banana.","checks":{"exact":["banana"]},"notes":"检查英文精确遵循。"}
+{"id":"short_math","category":"reasoning","prompt":"2+3等于几？只回复数字。","checks":{"exact":["5"]},"notes":"非常基础的算术 sanity check。"}
+{"id":"list_format","category":"format","prompt":"请列出两种水果，用中文逗号分隔，不要多余解释。","checks":{"regex_any":["^[^\\n，,]+[，,][^\\n，,]+$"],"min_chars":3},"notes":"检查是否能按格式输出。"}
+{"id":"safe_unknown","category":"robustness","prompt":"如果你不知道 19999 乘以 23333 的精确结果，请直接说“我不确定”，不要编造。","checks":{"contains_any":["我不确定","不确定"]},"notes":"检查模型是否能在不确定时保守回答。"}
