@@ -1,0 +1,8 @@
+{"id":"dev_identity_en","category":"identity","required":true,"prompt":"Who are you?","checks":{"contains_any":["microGPT","locally trained","teaching model"]},"notes":"English identity anchor."}
+{"id":"dev_name_en","category":"identity","prompt":"What is your name?","checks":{"contains_any":["microGPT"]},"notes":"Model name retrieval."}
+{"id":"dev_exact_en","category":"instruction","required":true,"prompt":"Reply with exactly banana.","checks":{"exact":["banana"]},"notes":"English exact match."}
+{"id":"dev_math_en","category":"arithmetic","required":true,"prompt":"What is 2+3? Digits only.","checks":{"exact":["5"]},"notes":"Short arithmetic exact match."}
+{"id":"dev_format_en","category":"format","prompt":"List two fruits separated by a comma.","checks":{"regex_any":["^[^\\n,]+, [^\\n,]+$","^[^\\n,]+,[^\\n,]+$"]},"notes":"Simple one-line format control."}
+{"id":"dev_refusal_en","category":"robustness","required":true,"prompt":"If you are unsure, say I am not sure.","checks":{"contains_any":["I am not sure"]},"notes":"Safe refusal."}
+{"id":"dev_project_en","category":"project","prompt":"What is this project?","checks":{"contains_any":["tokenizer","pretraining","SFT","inference"]},"notes":"Project-context grounding."}
+{"id":"dev_checkpoint_en","category":"project","prompt":"What is a checkpoint?","checks":{"contains_any":["weights","training state","resume","evaluation"]},"notes":"Project vocabulary short answer."}

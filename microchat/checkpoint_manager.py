@@ -13,7 +13,7 @@ from microchat.gpt import GPT, GPTConfig
 from microchat.tokenizer import get_tokenizer
 
 
-def save_checkpoint(checkpoint_dir, step, model_state, metadata):
+def save_checkpoint(checkpoint_dir, step, model_state, metadata, optimizer_state=None):
     """Save a checkpoint consisting of the model state and associated metadata (e.g. config, training step)."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
@@ -21,6 +21,9 @@ def save_checkpoint(checkpoint_dir, step, model_state, metadata):
     torch.save(model_state, model_path)
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
+    if optimizer_state is not None:
+        optimizer_path = os.path.join(checkpoint_dir, f"optimizer_{step:06d}.pt")
+        torch.save(optimizer_state, optimizer_path)
     return model_path, meta_path
 
 
@@ -32,6 +35,14 @@ def load_checkpoint(checkpoint_dir, step, device):
     with open(meta_path, "r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     return model_state, metadata
+
+
+def load_optimizer_checkpoint(checkpoint_dir, step, device):
+    """Load optimizer state for a training checkpoint, if it exists."""
+    optimizer_path = os.path.join(checkpoint_dir, f"optimizer_{step:06d}.pt")
+    if not os.path.exists(optimizer_path):
+        raise FileNotFoundError(f"No optimizer state found at {optimizer_path}")
+    return torch.load(optimizer_path, map_location=device)
 
 
 def find_last_step(checkpoint_dir):

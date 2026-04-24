@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 
 import torch
 import torch.nn as nn
@@ -67,6 +68,96 @@ def build_sliding_mask(query_positions, key_length, left_window, device):
     return allow
 
 
+def _zeropower_via_newtonschulz5(x, steps=5, eps=1e-7):
+    """Approximate the nearest orthogonal matrix using a low-cost Newton-Schulz iteration."""
+    orig_dtype = x.dtype
+    y = x.float()
+    if y.size(-2) > y.size(-1):
+        y = y.mT
+        transposed = True
+    else:
+        transposed = False
+    y = y / (y.norm() + eps)
+    for _ in range(steps):
+        a = y @ y.mT
+        b = 0.5 * (3.0 * torch.eye(a.size(-1), device=a.device, dtype=a.dtype) - a)
+        y = b @ y
+    if transposed:
+        y = y.mT
+    return y.to(orig_dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer for matrix parameters."""
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.ndim < 2:
+                    raise ValueError("Muon only supports matrix-like parameters")
+                state = self.state[param]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(grad)
+                update = grad.add(buf, alpha=momentum) if nesterov else buf
+                update = _zeropower_via_newtonschulz5(update, steps=ns_steps)
+                param.add_(update, alpha=-lr)
+        return loss
+
+
+class CombinedOptimizer:
+    """Small wrapper that presents Muon + AdamW as one optimizer."""
+    def __init__(self, *optimizers):
+        self.optimizers = [opt for opt in optimizers if opt is not None]
+        self.param_groups = [group for opt in self.optimizers for group in opt.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        for i, opt in enumerate(self.optimizers):
+            opt_loss = opt.step(closure if i == 0 else None)
+            if opt_loss is not None:
+                loss = opt_loss
+        return loss
+
+    def state_dict(self):
+        return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        for opt, opt_state in zip(self.optimizers, state_dict["optimizers"]):
+            opt.load_state_dict(opt_state)
+
+    def train(self):
+        for opt in self.optimizers:
+            if hasattr(opt, "train"):
+                opt.train()
+
+    def eval(self):
+        for opt in self.optimizers:
+            if hasattr(opt, "eval"):
+                opt.eval()
+
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 256         #序列长度
@@ -76,6 +167,7 @@ class GPTConfig:
     n_kv_head: int = 4              #KV头数量
     n_embd: int = 256               #嵌入维度
     window_pattern: str = "L"       #窗口模式，S短，L全
+    standard_gpt_block: bool = False
 
 
 #自注意力机制
@@ -194,19 +286,23 @@ class GPT(nn.Module):
         #输出层，把Transformer的输出映射到词表大小的维度，用于预测下一个词的概率分布
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         #公式：x_next = x_cur + λ_resid * block_out + λ_x0 * x0
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer), requires_grad=not config.standard_gpt_block)
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer), requires_grad=not config.standard_gpt_block)
         # 门控投影：将24维输入特征映射为1维门控分数
         self.smear_gate = Linear(24, 1, bias=False)
-        self.smear_lambda = nn.Parameter(torch.zeros(1))
+        self.smear_lambda = nn.Parameter(torch.zeros(1), requires_grad=not config.standard_gpt_block)
         #out = λ_backout * x
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
+        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1), requires_grad=not config.standard_gpt_block)
 
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
 
         self.value_embeds = nn.ModuleDict(
-            {str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)}
+            {
+                str(i): nn.Embedding(padded_vocab_size, kv_dim)
+                for i in range(config.n_layer)
+                if has_ve(i, config.n_layer) and not config.standard_gpt_block
+            }
         )
         #缓存cos,sin计算结果，避免每次前向计算时都要重新计算，节省计算资源和时间
         self.rotary_seq_len = config.sequence_len * 10
@@ -289,10 +385,38 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    #优化器
-    #TODO:优化器目前太简单了，可以继续优化，MOUN + AdamW
     def setup_optimizer(self, lr=3e-4, weight_decay=0.01):
-        return torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+        muon_params = []
+        adamw_decay_params = []
+        adamw_no_decay_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if (
+                param.ndim >= 2
+                and "transformer.wte" not in name
+                and "value_embeds" not in name
+                and "lm_head" not in name
+            ):
+                muon_params.append(param)
+            elif param.ndim < 2 or "transformer.wte" in name or "value_embeds" in name:
+                adamw_no_decay_params.append(param)
+            else:
+                adamw_decay_params.append(param)
+
+        adamw_kwargs = {"lr": lr, "betas": (0.9, 0.95)}
+        if "fused" in inspect.signature(torch.optim.AdamW).parameters:
+            adamw_kwargs["fused"] = self.get_device().type == "cuda"
+
+        muon = Muon(muon_params, lr=lr * 20, momentum=0.95) if muon_params else None
+        adamw = torch.optim.AdamW(
+            [
+                {"params": adamw_decay_params, "weight_decay": weight_decay},
+                {"params": adamw_no_decay_params, "weight_decay": 0.0},
+            ],
+            **adamw_kwargs,
+        )
+        return CombinedOptimizer(muon, adamw)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
         _, seq_len = idx.size()
@@ -304,15 +428,16 @@ class GPT(nn.Module):
         if kv_cache is None:
             if seq_len > 1:
                 #平滑输入，增强模型对连续输入的敏感性，促进更连贯的生成。gate的值根据输入动态调整，越大越能利用前一个位置的信息，但也增加计算量和可能的过拟合风险
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                if not self.config.standard_gpt_block:
+                    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                    x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
             previous = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
-            if seq_len > 1:
+            if seq_len > 1 and not self.config.standard_gpt_block:
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif previous is not None:
+            elif previous is not None and not self.config.standard_gpt_block:
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * previous
 
@@ -321,13 +446,14 @@ class GPT(nn.Module):
         backout_layer = self.config.n_layer // 2
         for layer_idx, block in enumerate(self.transformer.h):
             #公式：x_next = x_cur + λ_resid * block_out + λ_x0 * x0
-            x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
+            if not self.config.standard_gpt_block:
+                x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
             #拿到嵌入向量，隔层一个，节省计算资源和时间
             value_embedding = self.value_embeds[str(layer_idx)](idx).to(x.dtype) if str(layer_idx) in self.value_embeds else None
             #前向计算，得到下一层的输入
             x = block(x, value_embedding, cos_sin, self.window_sizes[layer_idx], kv_cache)
             #只在某些层存储backout信息，节省内存，同时提供足够的梯度流动路径，促进训练稳定性和性能提升
-            if layer_idx == backout_layer:
+            if layer_idx == backout_layer and not self.config.standard_gpt_block:
                 backout = x
         #减去backout信息，提供一个直接的梯度流动路径，帮助训练更深的模型，同时也可以看作是一种正则化，防止模型过拟合和梯度爆炸
         #让模型更加专注于学习新的残差

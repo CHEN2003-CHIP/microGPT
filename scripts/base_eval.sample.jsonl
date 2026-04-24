@@ -1,0 +1,3 @@
+{"id":"english_completion","prompt":"The capital of France is","expected":" Paris","alternatives":[" London"," banana"," quickly"]}
+{"id":"numeric_pattern","prompt":"Continue the pattern: 2, 4, 6,","expected":" 8","alternatives":[" 5"," cat"," France"]}
+{"id":"common_phrase","prompt":"Once upon a","expected":" time","alternatives":[" banana"," computer"," yesterday"]}

@@ -99,16 +99,112 @@ By default, checkpoints are written to:
 
 Use `--model-tag` if you want a custom checkpoint directory name.
 
-### 4. Run chat SFT
+Useful advanced training flags:
+
+- `--warmup-iters`, `--lr-decay-iters`, `--min-lr`: warmup + cosine decay schedule
+- `--grad-clip`: clip gradient norm for stability
+- `--save-every`: save periodic checkpoints during training
+- `--resume`: continue from the latest checkpoint under the selected model tag
+- `--max-train-tokens`: stop by token budget instead of only by step count
+- `--standard-gpt-block`: disable experimental residual/value-embedding paths for A/B runs
+
+Example for a stronger single-GPU recipe:
 
 ```bash
-uv run python scripts/chat_sft.py --model-tag d4 --num-iterations 20 --smoltalk-limit 20000 --local-repeat 50
+uv run python scripts/base_train.py --depth 6 --aspect-ratio 64 --head-dim 64 --max-seq-len 256 --num-iterations 2000 --total-batch-size 2048 --warmup-iters 100 --grad-clip 1.0 --save-every 200 --model-tag laptop_v2
+```
+
+Training metrics are appended to:
+
+```text
+.microchat/reports/<model-tag>_base_train_metrics.jsonl
+```
+
+A short Markdown summary is written to:
+
+```text
+.microchat/reports/<model-tag>_base_train_report.md
+```
+
+### 4. Run a base-model evaluation
+
+You can run a short completion-style evaluation before SFT:
+
+```bash
+uv run python scripts/base_eval.py -g d4
+```
+
+Default behavior:
+
+- Uses `.microchat/base_eval.jsonl` if present, otherwise falls back to `scripts/base_eval.sample.jsonl`
+- Loads the latest base checkpoint for the selected model tag
+- Writes Markdown and JSON reports to `.microchat/reports/base_eval/`
+
+Each JSONL row looks like:
+
+```json
+{"id":"english_completion","prompt":"The capital of France is","contains_any":["paris"],"forbidden_contains":["london"]}
+```
+
+### 5. Run chat SFT
+
+```bash
+uv run python scripts/chat_sft.py --model-tag d4 --num-iterations 500 --max-seq-len 256 --total-batch-size 1024 --learning-rate 5e-6 --warmup-iters 50 --save-every 100 --smoltalk-limit 0 --ultrachat-limit 0 --local-repeat 80
 ```
 
 SFT data behavior:
 
-- Online: uses `SmolTalk` plus local identity/instruction JSONL data
-- Offline fallback: uses the bundled `scripts/identity_conversations.sample.jsonl`
+- Phase A (recommended first): uses a bundled English-first anchor dataset for identity/instruction tuning
+- Phase B: mixes the anchor dataset with a light amount of `UltraChat 200k`
+- Offline fallback: still works with the bundled anchor dataset only
+
+Useful SFT flags:
+
+- `--smoltalk-limit`: limit SmolTalk rows; `0` disables SmolTalk
+- `--ultrachat-limit`: limit UltraChat 200k rows; `0` disables UltraChat
+- `--local-repeat`: oversample local identity/instruction examples
+- `--learning-rate`, `--min-lr`, `--warmup-iters`, `--lr-decay-iters`: stable SFT schedule
+- `--grad-clip`: clip gradient norm to reduce collapse
+- `--save-every`: save periodic SFT checkpoints
+- `--resume`: continue the latest SFT checkpoint
+- `--max-train-tokens`: stop by token budget instead of only by step count
+
+Phase A, anchor-only English instruction tuning:
+
+```bash
+uv run python scripts/chat_sft.py --model-tag scale_12x768_anchor --num-iterations 500 --max-seq-len 256 --device-batch-size 1 --total-batch-size 1024 --learning-rate 5e-6 --warmup-iters 50 --save-every 100 --smoltalk-limit 0 --ultrachat-limit 0 --local-repeat 80
+```
+
+Phase B, light generalization mix after Phase A works:
+
+```bash
+uv run python scripts/chat_sft.py --model-tag scale_12x768_mix --num-iterations 800 --max-seq-len 256 --device-batch-size 1 --total-batch-size 1024 --learning-rate 3e-6 --warmup-iters 50 --save-every 100 --smoltalk-limit 0 --ultrachat-limit 5000 --local-repeat 50
+```
+
+Curated local identity/instruction data is resolved in this order:
+
+- `.microchat/identity_conversations.jsonl` if you provide your own
+- `scripts/identity_conversations.anchor_en.jsonl`
+- `scripts/identity_conversations.curated.jsonl`
+- `scripts/identity_conversations.sample.jsonl`
+
+SFT metrics are appended to:
+
+```text
+.microchat/reports/<model-tag>_chat_sft_metrics.jsonl
+```
+
+A short Markdown summary is written to:
+
+```text
+.microchat/reports/<model-tag>_chat_sft_report.md
+```
+
+Periodic checkpoints are written to:
+
+```text
+.microchat/chatsft_checkpoints/<model-tag>/
+```
 
 SFT checkpoints are written to:
 
@@ -116,7 +212,7 @@ SFT checkpoints are written to:
 .microchat/chatsft_checkpoints/d4/
 ```
 
-### 5. Chat with the model
+### 6. Chat with the model
 
 ```bash
 uv run python scripts/chat_cli.py -i sft -g d4
@@ -139,7 +235,7 @@ Single-prompt example:
 uv run python scripts/chat_cli.py -i sft -g d4 -p "Introduce yourself."
 ```
 
-### 6. Run a chat evaluation benchmark
+### 7. Run a chat evaluation benchmark
 
 After SFT, you can run a small rule-based benchmark that prints pass/fail results,
 computes an overall score, and writes Markdown plus JSON reports.
@@ -188,6 +284,12 @@ Supported `checks` keys:
 - `regex_any`: at least one regex must match
 - `forbidden_contains`: none of these phrases may appear
 - `min_chars`: minimum response length
+
+To compare multiple saved SFT checkpoints and pick the best step by chat score:
+
+```bash
+uv run python scripts/chat_eval_sweep.py -g scale_12x768_anchor --eval-file scripts/chat_eval.dev_en.jsonl
+```
 
 ## Local Data and Artifact Directories
 
