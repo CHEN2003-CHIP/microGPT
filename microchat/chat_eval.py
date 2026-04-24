@@ -17,6 +17,8 @@ class EvalChecks:
     regex_any: list[str] = field(default_factory=list)
     forbidden_contains: list[str] = field(default_factory=list)
     min_chars: int = 0
+    max_chars: int = 0
+    max_ngram_repeats: int = 0
 
 
 @dataclass
@@ -51,6 +53,23 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _count_adjacent_ngram_repeats(text: str, n: int) -> int:
+    tokens = re.findall(r"\w+", text.lower())
+    if len(tokens) < 2 * n or n <= 0:
+        return 0
+
+    max_repeats = 1
+    for start in range(0, len(tokens) - (2 * n) + 1):
+        phrase = tuple(tokens[start : start + n])
+        current_repeats = 1
+        cursor = start + n
+        while cursor + n <= len(tokens) and tuple(tokens[cursor : cursor + n]) == phrase:
+            current_repeats += 1
+            cursor += n
+        max_repeats = max(max_repeats, current_repeats)
+    return max_repeats
+
+
 def load_eval_cases(path: str) -> list[EvalCase]:
     cases: list[EvalCase] = []
     with open(path, "r", encoding="utf-8") as handle:
@@ -67,6 +86,8 @@ def load_eval_cases(path: str) -> list[EvalCase]:
                 regex_any=_as_list(checks_raw.get("regex_any")),
                 forbidden_contains=_as_list(checks_raw.get("forbidden_contains")),
                 min_chars=int(checks_raw.get("min_chars", 0)),
+                max_chars=int(checks_raw.get("max_chars", 0)),
+                max_ngram_repeats=int(checks_raw.get("max_ngram_repeats", 0)),
             )
             case = EvalCase(
                 case_id=str(data.get("id", f"case_{line_number:03d}")),
@@ -97,6 +118,13 @@ def evaluate_response(case: EvalCase, response: str) -> EvalResult:
             passed_checks += 1
         else:
             reasons.append(f"too short (< {case.checks.min_chars} chars)")
+
+    if case.checks.max_chars > 0:
+        total_checks += 1
+        if len(raw_response) <= case.checks.max_chars:
+            passed_checks += 1
+        else:
+            reasons.append(f"too long (> {case.checks.max_chars} chars)")
 
     if case.checks.exact:
         total_checks += 1
@@ -135,6 +163,16 @@ def evaluate_response(case: EvalCase, response: str) -> EvalResult:
             passed_checks += 1
         else:
             reasons.append(f"contains forbidden phrases: {', '.join(forbidden_hits)}")
+
+    if case.checks.max_ngram_repeats > 0:
+        total_checks += 1
+        bigram_repeats = _count_adjacent_ngram_repeats(raw_response, 2)
+        trigram_repeats = _count_adjacent_ngram_repeats(raw_response, 3)
+        max_repeats = max(bigram_repeats, trigram_repeats)
+        if max_repeats <= case.checks.max_ngram_repeats:
+            passed_checks += 1
+        else:
+            reasons.append("repeated phrase loop detected")
 
     if total_checks == 0:
         total_checks = 1

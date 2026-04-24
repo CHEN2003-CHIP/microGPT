@@ -51,8 +51,9 @@ parser.add_argument(
     help="LR multiplier for experimental behavior parameters in adamw_behavior_low_lr mode",
 )
 parser.add_argument("--smoltalk-limit", type=int, default=0, help="Limit SmolTalk rows; 0 disables SmolTalk")
-parser.add_argument("--ultrachat-limit", type=int, default=3_000, help="Limit UltraChat 200k rows; 0 disables UltraChat")
-parser.add_argument("--local-repeat", type=int, default=24, help="Oversample the bundled local phase-2 SFT mix")
+parser.add_argument("--ultrachat-limit", type=int, default=3_000, help="Limit UltraChat 200k rows; set 0 for phase-3 local-only shaping")
+parser.add_argument("--local-repeat", type=int, default=24, help="Base multiplier for the bundled phase-3 local mix (anchor=1x, phase2=2x, phase3=3x)")
+parser.add_argument("--include-local-sample", action="store_true", help="Explicitly include identity_conversations.sample.jsonl in the local mix")
 args = parser.parse_args()
 
 import torch
@@ -103,19 +104,20 @@ def resolve_identity_dataset(base_dir):
 
 def resolve_local_sft_specs(base_dir):
     scripts_dir = os.path.dirname(__file__)
-    preferred = os.path.join(base_dir, "identity_conversations.jsonl")
     anchor_en = os.path.join(scripts_dir, "identity_conversations.anchor_en.jsonl")
     phase2_mix = os.path.join(scripts_dir, "chat_phase2_mix_en.jsonl")
-    sample = preferred if os.path.exists(preferred) else os.path.join(scripts_dir, "identity_conversations.sample.jsonl")
+    phase3_mix = os.path.join(scripts_dir, "chat_phase3_anti_repeat_en.jsonl")
+    sample = os.path.join(scripts_dir, "identity_conversations.sample.jsonl")
 
     specs = []
     if os.path.exists(anchor_en):
         specs.append({"name": "anchor_en", "path": anchor_en, "weight": 1})
     if os.path.exists(phase2_mix):
-        specs.append({"name": "phase2_mix_en", "path": phase2_mix, "weight": 3})
-    if os.path.exists(sample):
-        sample_name = "sample" if sample.endswith("identity_conversations.sample.jsonl") else "local_override"
-        specs.append({"name": sample_name, "path": sample, "weight": 1})
+        specs.append({"name": "phase2_mix_en", "path": phase2_mix, "weight": 2})
+    if os.path.exists(phase3_mix):
+        specs.append({"name": "phase3_anti_repeat_en", "path": phase3_mix, "weight": 3})
+    if args.include_local_sample and os.path.exists(sample):
+        specs.append({"name": "sample", "path": sample, "weight": 1})
     if not specs:
         fallback = resolve_identity_dataset(base_dir)
         specs.append({"name": "fallback", "path": fallback, "weight": 1})
@@ -126,13 +128,28 @@ def build_local_sft_tasks(base_dir, repeat_count):
     repeat_count = max(repeat_count, 1)
     train_tasks = []
     val_tasks = []
-    labels = []
+    details = []
     for spec in resolve_local_sft_specs(base_dir):
-        val_tasks.append(CustomJSON(filepath=spec["path"]))
+        dataset = CustomJSON(filepath=spec["path"])
+        raw_examples = len(dataset)
         copies = repeat_count * spec["weight"]
+        val_tasks.append(dataset)
         train_tasks.extend(CustomJSON(filepath=spec["path"]) for _ in range(copies))
-        labels.append(f"{spec['name']} x{copies}")
-    return train_tasks, val_tasks, ", ".join(labels)
+        details.append(
+            {
+                "name": spec["name"],
+                "path": spec["path"],
+                "raw_examples": raw_examples,
+                "repeat_count": copies,
+                "effective_examples": raw_examples * copies,
+            }
+        )
+
+    total_effective = sum(item["effective_examples"] for item in details) or 1
+    for item in details:
+        item["effective_share"] = item["effective_examples"] / total_effective
+    label = ", ".join(f"{item['name']} x{item['repeat_count']}" for item in details)
+    return train_tasks, val_tasks, label, details
 
 
 def build_sft_datasets(base_dir):
@@ -140,13 +157,13 @@ def build_sft_datasets(base_dir):
     Prefer a phase-2 local mix of anchor/style/general-answer datasets, optionally
     blended with a light amount of remote chat data.
     """
-    local_train_tasks, local_val_tasks, local_label = build_local_sft_tasks(base_dir, args.local_repeat)
+    local_train_tasks, local_val_tasks, local_label, local_details = build_local_sft_tasks(base_dir, args.local_repeat)
 
     if args.smoltalk_limit == 0 and args.ultrachat_limit == 0:
         train_dataset = TaskMixture(local_train_tasks)
         val_dataset = TaskMixture(local_val_tasks)
         dataset_label = f"CustomJSON local mix ({local_label})"
-        return train_dataset, val_dataset, dataset_label
+        return train_dataset, val_dataset, dataset_label, local_details
 
     try:
         train_tasks = []
@@ -167,7 +184,7 @@ def build_sft_datasets(base_dir):
             train_dataset = TaskMixture(local_train_tasks)
             val_dataset = TaskMixture(local_val_tasks)
             dataset_label = f"CustomJSON local mix ({local_label})"
-            return train_dataset, val_dataset, dataset_label
+            return train_dataset, val_dataset, dataset_label, local_details
 
         train_dataset = TaskMixture([*train_tasks, *local_train_tasks])
         val_dataset = TaskMixture(val_tasks)
@@ -175,12 +192,25 @@ def build_sft_datasets(base_dir):
     except Exception as exc:
         print0(f"Remote SFT datasets unavailable on this machine, falling back to bundled local conversations: {exc!r}")
         offline_repeat = max(args.local_repeat, 3)
-        local_train_tasks, local_val_tasks, local_label = build_local_sft_tasks(base_dir, offline_repeat)
+        local_train_tasks, local_val_tasks, local_label, local_details = build_local_sft_tasks(base_dir, offline_repeat)
         train_dataset = TaskMixture(local_train_tasks)
         val_dataset = TaskMixture(local_val_tasks)
         dataset_label = f"CustomJSON local mix (offline fallback: {local_label})"
 
-    return train_dataset, val_dataset, dataset_label
+    return train_dataset, val_dataset, dataset_label, local_details
+
+
+def print_local_mix_summary(local_details):
+    total_effective = sum(item["effective_examples"] for item in local_details) or 1
+    print0("Local mix summary:")
+    for item in local_details:
+        share_pct = 100.0 * item["effective_examples"] / total_effective
+        print0(
+            "  - "
+            f"{item['name']}: raw={item['raw_examples']}, repeat={item['repeat_count']}, "
+            f"effective={item['effective_examples']}, share={share_pct:.1f}%"
+        )
+    print0(f"Sample dataset enabled: {'YES' if args.include_local_sample else 'NO'}")
 
 
 def build_sft_loader(tokenizer, dataset, batch_size, seq_len, device, buffer_size=128, pack_conversations=False):
@@ -379,7 +409,7 @@ def train():
     start_step, best_val_bpb, tokens_seen, history = maybe_resume(model, optimizer, checkpoint_dir, device)
 
     base_dir = get_base_dir()
-    train_dataset, val_dataset, dataset_label = build_sft_datasets(base_dir)
+    train_dataset, val_dataset, dataset_label, local_details = build_sft_datasets(base_dir)
     train_loader = build_sft_loader(
         tokenizer,
         train_dataset,
@@ -408,6 +438,9 @@ def train():
 
     print0(f"Loaded base checkpoint step {metadata['step']}")
     print0(f"Training mixture: {len(train_dataset):,} conversations ({dataset_label})")
+    print_local_mix_summary(local_details)
+    if args.ultrachat_limit == 0 and args.smoltalk_limit == 0:
+        print0("Phase-3 shaping mode: local-only mix, frequent checkpoints, and sweep/CLI selection are recommended.")
     print0(f"SFT optimizer: {args.sft_optimizer} (behavior_lr_scale={args.behavior_lr_scale})")
     print0(f"Conversation packing: {'ON' if args.pack_conversations else 'OFF'}")
     print0(f"Gradient accumulation steps: {grad_accum_steps}")

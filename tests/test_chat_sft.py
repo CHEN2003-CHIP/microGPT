@@ -47,12 +47,27 @@ def test_chat_sft_resolve_identity_dataset_prefers_curated_when_local_missing():
 def test_chat_sft_builds_phase2_local_mix():
     module = load_chat_sft_module()
     base_dir = os.path.join(os.getcwd(), ".microchat")
-    train_tasks, val_tasks, label = module.build_local_sft_tasks(base_dir, repeat_count=2)
+    module.args.include_local_sample = False
+    train_tasks, val_tasks, label, details = module.build_local_sft_tasks(base_dir, repeat_count=2)
 
     assert len(train_tasks) >= 6
     assert len(val_tasks) >= 2
     assert "anchor_en" in label
     assert "phase2_mix_en" in label
+    assert "phase3_anti_repeat_en" in label
+    assert "sample" not in label
+    assert all(item["effective_examples"] > 0 for item in details)
+
+
+def test_chat_sft_can_explicitly_include_sample():
+    module = load_chat_sft_module()
+    base_dir = os.path.join(os.getcwd(), ".microchat")
+    module.args.include_local_sample = True
+    _, _, label, details = module.build_local_sft_tasks(base_dir, repeat_count=1)
+
+    assert "sample" in label
+    assert any(item["name"] == "sample" for item in details)
+    module.args.include_local_sample = False
 
 
 def build_test_tokenizer():
@@ -110,5 +125,13 @@ def test_phase2_mix_dataset_loads_with_customjson():
     from tasks.customjson import CustomJSON
 
     dataset = CustomJSON(filepath=os.path.join(os.getcwd(), "scripts", "chat_phase2_mix_en.jsonl"))
+    assert len(dataset) >= 20
+    assert dataset[0]["messages"][0]["role"] == "user"
+
+
+def test_phase3_mix_dataset_loads_with_customjson():
+    from tasks.customjson import CustomJSON
+
+    dataset = CustomJSON(filepath=os.path.join(os.getcwd(), "scripts", "chat_phase3_anti_repeat_en.jsonl"))
     assert len(dataset) >= 20
     assert dataset[0]["messages"][0]["role"] == "user"
