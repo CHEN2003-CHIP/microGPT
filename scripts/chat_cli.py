@@ -16,6 +16,9 @@ parser.add_argument("-s", "--step", type=int, default=None, help="Checkpoint ste
 parser.add_argument("-p", "--prompt", type=str, default="", help="Single prompt mode")
 parser.add_argument("-t", "--temperature", type=float, default=0.6, help="Sampling temperature")
 parser.add_argument("-k", "--top-k", type=int, default=50, help="Top-k sampling")
+parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling")
+parser.add_argument("--repetition-penalty", type=float, default=1.1, help="Penalty for previously seen tokens")
+parser.add_argument("--stop-on-user-start", action="store_true", help="Stop generation if the model starts the next user turn")
 parser.add_argument("-m", "--max-tokens", type=int, default=256, help="Maximum generated tokens per answer")
 parser.add_argument("--device-type", type=str, default="", choices=["cuda", "cpu", "mps"], help="Device override")
 args = parser.parse_args()
@@ -70,6 +73,9 @@ while True:
 
     conversation_tokens.extend([user_start, *tokenizer.encode(user_input), user_end, assistant_start])
     response_tokens = []
+    stop_token_ids = [assistant_end]
+    if args.stop_on_user_start:
+        stop_token_ids.append(user_start)
     print("\nAssistant: ", end="", flush=True)
     for token_column, _ in engine.generate(
         conversation_tokens,
@@ -77,9 +83,12 @@ while True:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        stop_token_ids=stop_token_ids,
     ):
         token = token_column[0]
-        if token == assistant_end:
+        if token in stop_token_ids:
             break
         response_tokens.append(token)
         print(tokenizer.decode([token]), end="", flush=True)

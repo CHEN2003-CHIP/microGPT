@@ -21,24 +21,38 @@ parser = argparse.ArgumentParser(description="Run supervised fine-tuning")
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--model-tag", type=str, default=None, help="Base model tag to load and SFT tag to write")
 parser.add_argument("--model-step", type=int, default=None, help="Base checkpoint step to load")
-parser.add_argument("--num-iterations", type=int, default=1000, help="Number of optimizer steps")
+parser.add_argument("--num-iterations", type=int, default=800, help="Number of optimizer steps")
 parser.add_argument("--max-train-tokens", type=int, default=0, help="Optional token budget cap; 0 disables")
-parser.add_argument("--max-seq-len", type=int, default=256, help="Context length")
+parser.add_argument("--max-seq-len", type=int, default=512, help="Context length")
 parser.add_argument("--device-batch-size", type=int, default=1, help="Per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=512, help="Total tokens per optimizer step")
-parser.add_argument("--learning-rate", type=float, default=2e-5, help="Peak AdamW learning rate")
-parser.add_argument("--min-lr", type=float, default=2e-6, help="Minimum learning rate after cosine decay")
-parser.add_argument("--warmup-iters", type=int, default=100, help="Linear warmup iterations")
+parser.add_argument("--learning-rate", type=float, default=3e-6, help="Peak AdamW learning rate")
+parser.add_argument("--min-lr", type=float, default=3e-7, help="Minimum learning rate after cosine decay")
+parser.add_argument("--warmup-iters", type=int, default=80, help="Linear warmup iterations")
 parser.add_argument("--lr-decay-iters", type=int, default=0, help="Cosine decay length in optimizer steps; 0 uses total steps")
-parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay")
+parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay")
 parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping max norm; <=0 disables")
 parser.add_argument("--eval-every", type=int, default=100, help="Run validation every N steps")
 parser.add_argument("--eval-tokens", type=int, default=2048, help="Validation token budget")
-parser.add_argument("--save-every", type=int, default=250, help="Save a checkpoint every N steps; 0 disables periodic save")
+parser.add_argument("--save-every", type=int, default=100, help="Save a checkpoint every N steps; 0 disables periodic save")
 parser.add_argument("--resume", action="store_true", help="Resume the latest SFT checkpoint for the selected model tag")
+parser.add_argument("--pack-conversations", action="store_true", help="Pack multiple conversations into one training row")
+parser.add_argument(
+    "--sft-optimizer",
+    type=str,
+    default="adamw_full",
+    choices=["adamw_full", "adamw_behavior_low_lr"],
+    help="SFT optimizer grouping strategy",
+)
+parser.add_argument(
+    "--behavior-lr-scale",
+    type=float,
+    default=0.2,
+    help="LR multiplier for experimental behavior parameters in adamw_behavior_low_lr mode",
+)
 parser.add_argument("--smoltalk-limit", type=int, default=0, help="Limit SmolTalk rows; 0 disables SmolTalk")
-parser.add_argument("--ultrachat-limit", type=int, default=20_000, help="Limit UltraChat 200k rows; 0 disables UltraChat")
-parser.add_argument("--local-repeat", type=int, default=40, help="Oversample local curated identity/instruction examples")
+parser.add_argument("--ultrachat-limit", type=int, default=3_000, help="Limit UltraChat 200k rows; 0 disables UltraChat")
+parser.add_argument("--local-repeat", type=int, default=24, help="Oversample the bundled local phase-2 SFT mix")
 args = parser.parse_args()
 
 import torch
@@ -87,24 +101,56 @@ def resolve_identity_dataset(base_dir):
     return bundled
 
 
+def resolve_local_sft_specs(base_dir):
+    scripts_dir = os.path.dirname(__file__)
+    preferred = os.path.join(base_dir, "identity_conversations.jsonl")
+    anchor_en = os.path.join(scripts_dir, "identity_conversations.anchor_en.jsonl")
+    phase2_mix = os.path.join(scripts_dir, "chat_phase2_mix_en.jsonl")
+    sample = preferred if os.path.exists(preferred) else os.path.join(scripts_dir, "identity_conversations.sample.jsonl")
+
+    specs = []
+    if os.path.exists(anchor_en):
+        specs.append({"name": "anchor_en", "path": anchor_en, "weight": 1})
+    if os.path.exists(phase2_mix):
+        specs.append({"name": "phase2_mix_en", "path": phase2_mix, "weight": 3})
+    if os.path.exists(sample):
+        sample_name = "sample" if sample.endswith("identity_conversations.sample.jsonl") else "local_override"
+        specs.append({"name": sample_name, "path": sample, "weight": 1})
+    if not specs:
+        fallback = resolve_identity_dataset(base_dir)
+        specs.append({"name": "fallback", "path": fallback, "weight": 1})
+    return specs
+
+
+def build_local_sft_tasks(base_dir, repeat_count):
+    repeat_count = max(repeat_count, 1)
+    train_tasks = []
+    val_tasks = []
+    labels = []
+    for spec in resolve_local_sft_specs(base_dir):
+        val_tasks.append(CustomJSON(filepath=spec["path"]))
+        copies = repeat_count * spec["weight"]
+        train_tasks.extend(CustomJSON(filepath=spec["path"]) for _ in range(copies))
+        labels.append(f"{spec['name']} x{copies}")
+    return train_tasks, val_tasks, ", ".join(labels)
+
+
 def build_sft_datasets(base_dir):
     """
-    Prefer UltraChat/SmolTalk mixed with a curated local identity/instruction set.
-    If remote datasets are unavailable, fall back to the local curated set only.
+    Prefer a phase-2 local mix of anchor/style/general-answer datasets, optionally
+    blended with a light amount of remote chat data.
     """
-    identity_path = resolve_identity_dataset(base_dir)
-    local_task = CustomJSON(filepath=identity_path)
-    local_tasks = [CustomJSON(filepath=identity_path) for _ in range(max(args.local_repeat, 1))]
+    local_train_tasks, local_val_tasks, local_label = build_local_sft_tasks(base_dir, args.local_repeat)
 
     if args.smoltalk_limit == 0 and args.ultrachat_limit == 0:
-        train_dataset = TaskMixture(local_tasks)
-        val_dataset = TaskMixture([local_task])
-        dataset_label = f"CustomJSON only (curated local mode, x{max(args.local_repeat, 1)})"
+        train_dataset = TaskMixture(local_train_tasks)
+        val_dataset = TaskMixture(local_val_tasks)
+        dataset_label = f"CustomJSON local mix ({local_label})"
         return train_dataset, val_dataset, dataset_label
 
     try:
         train_tasks = []
-        val_tasks = [local_task]
+        val_tasks = list(local_val_tasks)
         labels = []
 
         if args.smoltalk_limit > 0:
@@ -118,24 +164,26 @@ def build_sft_datasets(base_dir):
             labels.append(f"UltraChat(limit={args.ultrachat_limit})")
 
         if not train_tasks:
-            train_dataset = TaskMixture(local_tasks)
-            val_dataset = TaskMixture([local_task])
-            dataset_label = f"CustomJSON only (curated local mode, x{max(args.local_repeat, 1)})"
+            train_dataset = TaskMixture(local_train_tasks)
+            val_dataset = TaskMixture(local_val_tasks)
+            dataset_label = f"CustomJSON local mix ({local_label})"
             return train_dataset, val_dataset, dataset_label
 
-        train_dataset = TaskMixture([*train_tasks, *local_tasks])
+        train_dataset = TaskMixture([*train_tasks, *local_train_tasks])
         val_dataset = TaskMixture(val_tasks)
-        dataset_label = " + ".join([*labels, f"CustomJSON(x{max(args.local_repeat, 1)})"])
+        dataset_label = " + ".join([*labels, f"LocalMix({local_label})"])
     except Exception as exc:
         print0(f"Remote SFT datasets unavailable on this machine, falling back to bundled local conversations: {exc!r}")
-        train_dataset = TaskMixture([CustomJSON(filepath=identity_path) for _ in range(max(args.local_repeat, 3))])
-        val_dataset = TaskMixture([CustomJSON(filepath=identity_path)])
-        dataset_label = f"CustomJSON only (offline fallback, x{max(args.local_repeat, 3)})"
+        offline_repeat = max(args.local_repeat, 3)
+        local_train_tasks, local_val_tasks, local_label = build_local_sft_tasks(base_dir, offline_repeat)
+        train_dataset = TaskMixture(local_train_tasks)
+        val_dataset = TaskMixture(local_val_tasks)
+        dataset_label = f"CustomJSON local mix (offline fallback: {local_label})"
 
     return train_dataset, val_dataset, dataset_label
 
 
-def build_sft_loader(tokenizer, dataset, batch_size, seq_len, device, buffer_size=128):
+def build_sft_loader(tokenizer, dataset, batch_size, seq_len, device, buffer_size=128, pack_conversations=False):
     bos_token = tokenizer.get_bos_token_id()
     row_capacity = seq_len + 1
     use_cuda = device.type == "cuda"
@@ -157,26 +205,31 @@ def build_sft_loader(tokenizer, dataset, batch_size, seq_len, device, buffer_siz
         rows, masks, lengths = [], [], []
         for _ in range(batch_size):
             row, mask = [], []
-            while len(row) < row_capacity:
-                remaining = row_capacity - len(row)
-                candidate_index = -1
-                candidate_len = 0
-                for index, (token_ids, _) in enumerate(buffer):
-                    if len(token_ids) <= remaining and len(token_ids) > candidate_len:
-                        candidate_index = index
-                        candidate_len = len(token_ids)
-                if candidate_index >= 0:
-                    token_ids, loss_mask = buffer.pop(candidate_index)
-                    row.extend(token_ids)
-                    mask.extend(loss_mask)
-                    continue
-                content_length = len(row)
-                row.extend([bos_token] * remaining)
-                mask.extend([0] * remaining)
-                lengths.append(content_length)
-                break
-            if len(lengths) < len(rows) + 1:
-                lengths.append(row_capacity)
+            if pack_conversations:
+                while len(row) < row_capacity:
+                    remaining = row_capacity - len(row)
+                    candidate_index = -1
+                    candidate_len = 0
+                    for index, (token_ids, _) in enumerate(buffer):
+                        if len(token_ids) <= remaining and len(token_ids) > candidate_len:
+                            candidate_index = index
+                            candidate_len = len(token_ids)
+                    if candidate_index >= 0:
+                        token_ids, loss_mask = buffer.pop(candidate_index)
+                        row.extend(token_ids)
+                        mask.extend(loss_mask)
+                        continue
+                    break
+            else:
+                token_ids, loss_mask = buffer.pop(0)
+                row.extend(token_ids)
+                mask.extend(loss_mask)
+
+            content_length = len(row)
+            if content_length < row_capacity:
+                row.extend([bos_token] * (row_capacity - content_length))
+                mask.extend([0] * (row_capacity - content_length))
+            lengths.append(content_length)
             rows.append(row[:row_capacity])
             masks.append(mask[:row_capacity])
 
@@ -184,10 +237,15 @@ def build_sft_loader(tokenizer, dataset, batch_size, seq_len, device, buffer_siz
         inputs = batch[:, :-1].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
         targets = batch[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
         mask_tensor = torch.tensor(masks, dtype=torch.int8)
+        # The renderer decides which tokens are supervised. After shifting we
+        # simply ignore every target position that does not belong to the
+        # assistant side of the conversation.
         target_mask = mask_tensor[:, 1:].to(device=device)
         targets[target_mask == 0] = -1
         for row_index, content_length in enumerate(lengths):
-            if content_length < row_capacity:
+            if content_length <= 0:
+                targets[row_index, :] = -1
+            elif content_length < row_capacity:
                 targets[row_index, content_length - 1 :] = -1
         yield inputs, targets
 
@@ -215,7 +273,7 @@ def compute_learning_rate(step: int, total_steps: int):
 
 def set_optimizer_lr(optimizer, lr: float):
     for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+        param_group["lr"] = lr * param_group.get("lr_scale", 1.0)
 
 
 def append_metric(path: str, payload):
@@ -310,15 +368,34 @@ def train():
     _, _, _, _, device = compute_init(device_type)
     model, tokenizer, metadata = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
     token_bytes = get_token_bytes(device=device)
-    optimizer = model.setup_optimizer(lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = model.setup_sft_optimizer(
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        optimizer_type=args.sft_optimizer,
+        behavior_lr_scale=args.behavior_lr_scale,
+    )
 
     checkpoint_dir = get_sft_checkpoint_dir()
     start_step, best_val_bpb, tokens_seen, history = maybe_resume(model, optimizer, checkpoint_dir, device)
 
     base_dir = get_base_dir()
     train_dataset, val_dataset, dataset_label = build_sft_datasets(base_dir)
-    train_loader = build_sft_loader(tokenizer, train_dataset, args.device_batch_size, args.max_seq_len, device)
-    val_loader = lambda: build_sft_loader(tokenizer, val_dataset, args.device_batch_size, args.max_seq_len, device)
+    train_loader = build_sft_loader(
+        tokenizer,
+        train_dataset,
+        args.device_batch_size,
+        args.max_seq_len,
+        device,
+        pack_conversations=args.pack_conversations,
+    )
+    val_loader = lambda: build_sft_loader(
+        tokenizer,
+        val_dataset,
+        args.device_batch_size,
+        args.max_seq_len,
+        device,
+        pack_conversations=args.pack_conversations,
+    )
 
     tokens_per_micro_step = args.device_batch_size * args.max_seq_len
     assert args.total_batch_size % tokens_per_micro_step == 0, "total_batch_size must divide into micro-steps"
@@ -331,6 +408,8 @@ def train():
 
     print0(f"Loaded base checkpoint step {metadata['step']}")
     print0(f"Training mixture: {len(train_dataset):,} conversations ({dataset_label})")
+    print0(f"SFT optimizer: {args.sft_optimizer} (behavior_lr_scale={args.behavior_lr_scale})")
+    print0(f"Conversation packing: {'ON' if args.pack_conversations else 'OFF'}")
     print0(f"Gradient accumulation steps: {grad_accum_steps}")
     print0(f"Tokens per optimizer step: {tokens_per_step}")
     print0(f"Target training steps: {final_step}")

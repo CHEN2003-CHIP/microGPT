@@ -266,6 +266,94 @@ class RustBPETokenizer:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
 
+    def _normalize_conversation_messages(self, conversation):
+        messages = copy.deepcopy(conversation["messages"])
+        assert messages, "Conversation must have at least one message"
+        if messages[0]["role"] != "system":
+            return messages
+
+        assert len(messages) >= 2, "System message must be followed by at least one user message"
+        assert messages[1]["role"] == "user", "System message must be followed by a user message"
+        messages[1]["content"] = (
+            "System instruction:\n"
+            f"{messages[0]['content']}\n\n"
+            "User message:\n"
+            f"{messages[1]['content']}"
+        )
+        return messages[1:]
+
+    def _render_messages(self, messages):
+        ids, mask = [], []
+
+        def add_tokens(token_ids, mask_val):
+            if isinstance(token_ids, int):
+                token_ids = [token_ids]
+            ids.extend(token_ids)
+            mask.extend([mask_val] * len(token_ids))
+
+        bos = self.get_bos_token_id()
+        user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
+        assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
+        python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
+        output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+
+        add_tokens(bos, 0)
+        for i, message in enumerate(messages):
+            must_be_from = "user" if i % 2 == 0 else "assistant"
+            assert message["role"] == must_be_from, f"Message {i} is from {message['role']} but should be from {must_be_from}"
+            content = message["content"]
+
+            if message["role"] == "user":
+                assert isinstance(content, str), "User messages are simply expected to be strings"
+                add_tokens(user_start, 0)
+                add_tokens(self.encode(content), 0)
+                add_tokens(user_end, 0)
+                continue
+
+            add_tokens(assistant_start, 0)
+            if isinstance(content, str):
+                add_tokens(self.encode(content), 1)
+            elif isinstance(content, list):
+                for part in content:
+                    value_ids = self.encode(part["text"])
+                    if part["type"] == "text":
+                        add_tokens(value_ids, 1)
+                    elif part["type"] == "python":
+                        add_tokens(python_start, 1)
+                        add_tokens(value_ids, 1)
+                        add_tokens(python_end, 1)
+                    elif part["type"] == "python_output":
+                        add_tokens(output_start, 0)
+                        add_tokens(value_ids, 0)
+                        add_tokens(output_end, 0)
+                    else:
+                        raise ValueError(f"Unknown part type: {part['type']}")
+            else:
+                raise ValueError(f"Unknown content type: {type(content)}")
+            add_tokens(assistant_end, 1)
+
+        return ids, mask
+
+    def _truncate_messages_to_max_tokens(self, messages, max_tokens):
+        ids, mask = self._render_messages(messages)
+        if len(ids) <= max_tokens:
+            return ids, mask
+
+        for start in range(max(0, len(messages) - 2), -1, -2):
+            candidate_messages = messages[start:]
+            candidate_ids, candidate_mask = self._render_messages(candidate_messages)
+            if len(candidate_ids) <= max_tokens:
+                return candidate_ids, candidate_mask
+
+        supervised_positions = [index for index, value in enumerate(mask) if value == 1]
+        if supervised_positions:
+            end = min(len(ids), supervised_positions[-1] + 1)
+            start = max(0, end - max_tokens)
+        else:
+            start = max(0, len(ids) - max_tokens)
+            end = len(ids)
+        return ids[start:end], mask[start:end]
+
     def render_conversation(self, conversation, max_tokens=2048):
         """
         Tokenize a single Chat conversation (which we call a "doc" or "document" here).
@@ -273,85 +361,9 @@ class RustBPETokenizer:
         - ids: list[int] is a list of token ids of this rendered conversation
         - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
         """
-        # ids, masks that we will return and a helper function to help build them up.
-        ids, mask = [], []
-        def add_tokens(token_ids, mask_val):
-            if isinstance(token_ids, int):
-                token_ids = [token_ids]
-            ids.extend(token_ids)
-            mask.extend([mask_val] * len(token_ids))
-
-        # sometimes the first message is a system message...
-        # => just merge it with the second (user) message
-        #一种妥协来解决第一个消息是系统消息的问题（user+assistant）
-        if conversation["messages"][0]["role"] == "system":
-            # some conversation surgery is necessary here for now...
-            conversation = copy.deepcopy(conversation) # avoid mutating the original
-            messages = conversation["messages"]
-            assert messages[1]["role"] == "user", "System message must be followed by a user message"
-            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
-            messages = messages[1:]
-        else:
-            messages = conversation["messages"]
+        messages = self._normalize_conversation_messages(conversation)
         assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
-
-        # fetch all the special tokens we need
-        bos = self.get_bos_token_id()
-        user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
-        assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
-        python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
-        output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
-
-        # now we can tokenize the conversation
-        add_tokens(bos, 0)
-        for i, message in enumerate(messages):
-
-            # some sanity checking here around assumptions, to prevent footguns
-            must_be_from = "user" if i % 2 == 0 else "assistant"
-            assert message["role"] == must_be_from, f"Message {i} is from {message['role']} but should be from {must_be_from}"
-
-            # content can be either a simple string or a list of parts (e.g. containing tool calls)
-            content = message["content"]
-
-            if message["role"] == "user":
-                assert isinstance(content, str), "User messages are simply expected to be strings"
-                value_ids = self.encode(content)
-                add_tokens(user_start, 0)
-                add_tokens(value_ids, 0)
-                add_tokens(user_end, 0)
-            elif message["role"] == "assistant":
-                add_tokens(assistant_start, 0)
-                if isinstance(content, str):
-                    # simple string => simply add the tokens
-                    value_ids = self.encode(content)
-                    add_tokens(value_ids, 1)
-                elif isinstance(content, list):
-                    for part in content:
-                        value_ids = self.encode(part["text"])
-                        if part["type"] == "text":
-                            # string part => simply add the tokens
-                            add_tokens(value_ids, 1)
-                        elif part["type"] == "python":
-                            # python tool call => add the tokens inside <|python_start|> and <|python_end|>
-                            add_tokens(python_start, 1)
-                            add_tokens(value_ids, 1)
-                            add_tokens(python_end, 1)
-                        elif part["type"] == "python_output":
-                            # python output => add the tokens inside <|output_start|> and <|output_end|>
-                            # none of these tokens are supervised because the tokens come from Python at test time
-                            add_tokens(output_start, 0)
-                            add_tokens(value_ids, 0)
-                            add_tokens(output_end, 0)
-                        else:
-                            raise ValueError(f"Unknown part type: {part['type']}")
-                else:
-                    raise ValueError(f"Unknown content type: {type(content)}")
-                add_tokens(assistant_end, 1)
-
-        # truncate to max_tokens tokens MAX (helps prevent OOMs)
-        ids = ids[:max_tokens]
-        mask = mask[:max_tokens]
-        return ids, mask
+        return self._truncate_messages_to_max_tokens(messages, max_tokens)
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
         """Small helper function useful in debugging: visualize the tokenization of render_conversation"""

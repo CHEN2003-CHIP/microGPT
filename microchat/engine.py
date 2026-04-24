@@ -45,15 +45,23 @@ class KVCache:
 
 
 @torch.inference_mode()
-def sample_next_token(logits, rng, temperature=1.0, top_k=None):
+def sample_next_token(logits, rng, temperature=1.0, top_k=None, top_p=None):
     if temperature == 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
     if top_k is not None and top_k > 0:
         top_k = min(top_k, logits.size(-1))
         values, indices = torch.topk(logits, top_k, dim=-1)
-        probs = F.softmax(values / temperature, dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1, generator=rng)
-        return indices.gather(1, sampled)
+        logits = torch.full_like(logits, -float("inf"))
+        logits.scatter_(1, indices, values)
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = F.softmax(sorted_logits / temperature, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_mask = cumulative_probs > top_p
+        sorted_mask[:, 0] = False
+        sorted_logits = sorted_logits.masked_fill(sorted_mask, -float("inf"))
+        logits = torch.full_like(logits, -float("inf"))
+        logits.scatter_(1, sorted_indices, sorted_logits)
     probs = F.softmax(logits / temperature, dim=-1)
     return torch.multinomial(probs, num_samples=1, generator=rng)
 
@@ -65,8 +73,22 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer
 
+
+    #prefill先把提示词运算kvcache进行预热，然后在generate里用这个预热好的kvcache进行解码，直到生成结束或者达到最大生成长度
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(
+        self,
+        tokens,
+        num_samples=1,
+        max_tokens=None,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        repetition_penalty=1.0,
+        stop_token_ids=None,
+        seed=42,
+    ):
+        """Generate tokens autoregressively, yielding one token at a time. Generation stops when max_tokens is reached or when all samples generate an end token."""
         assert isinstance(tokens, list) and tokens and isinstance(tokens[0], int)
         device = self.model.get_device()
         dtype = COMPUTE_DTYPE if device.type == "cuda" else torch.float32
@@ -75,8 +97,10 @@ class Engine:
 
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
+        stop_ids = set(stop_token_ids or [])
+        stop_ids.update({assistant_end, bos})
         config = self.model.config
-
+        # 1. Prefill the KV cache with the prompt tokens, getting the initial logits for the next token
         prefill_cache = KVCache(
             batch_size=1,
             num_heads=config.n_kv_head,
@@ -102,6 +126,7 @@ class Engine:
         decode_cache.prefill(prefill_cache)
 
         completed = [False] * num_samples
+        seen_tokens = [set(tokens) for _ in range(num_samples)]
         generated = 0
         while True:
             if max_tokens is not None and generated >= max_tokens:
@@ -109,12 +134,18 @@ class Engine:
             if all(completed):
                 break
 
-            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            adjusted_logits = logits.clone()
+            if repetition_penalty > 1.0:
+                for row_index, seen in enumerate(seen_tokens):
+                    if seen:
+                        adjusted_logits[row_index, list(seen)] /= repetition_penalty
+            next_ids = sample_next_token(adjusted_logits, rng, temperature, top_k, top_p)
             token_column = next_ids[:, 0].tolist()
             token_masks = [1] * num_samples
 
             for row, token in enumerate(token_column):
-                if token == assistant_end or token == bos:
+                seen_tokens[row].add(token)
+                if token in stop_ids:
                     completed[row] = True
 
             yield token_column, token_masks
@@ -128,12 +159,14 @@ class Engine:
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
+        stop_ids = set(kwargs.get("stop_token_ids") or [])
+        stop_ids.update({assistant_end, bos})
 
         for token_column, token_masks in self.generate(tokens, num_samples=num_samples, **kwargs):
             for row_index, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if completed[row_index]:
                     continue
-                if token in {assistant_end, bos}:
+                if token in stop_ids:
                     completed[row_index] = True
                     continue
                 results[row_index].append(token)

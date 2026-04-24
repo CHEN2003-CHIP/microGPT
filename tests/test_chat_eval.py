@@ -1,4 +1,6 @@
-from microchat.chat_eval import EvalCase, EvalChecks, evaluate_response, summarize_results
+import os
+
+from microchat.chat_eval import EvalCase, EvalChecks, evaluate_response, load_eval_cases, summarize_results
 
 
 def test_evaluate_response_passes_all_checks():
@@ -55,3 +57,12 @@ def test_summarize_results_respects_required_failures():
     assert summary["overall_score"] == 0.5
     assert summary["qualified"] is False
     assert [item.case.case_id for item in summary["required_failures"]] == ["required"]
+
+
+def test_phase2_eval_file_loads():
+    path = os.path.join(os.getcwd(), "scripts", "chat_eval.phase2_en.jsonl")
+    cases = load_eval_cases(path)
+
+    assert len(cases) >= 6
+    assert any(case.case_id == "tree_definition" for case in cases)
+    assert any(case.required for case in cases)

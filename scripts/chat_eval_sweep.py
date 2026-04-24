@@ -20,6 +20,9 @@ parser.add_argument("--pass-threshold", type=float, default=0.8, help="Overall p
 parser.add_argument("--max-tokens", type=int, default=128, help="Maximum generated tokens per answer")
 parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
 parser.add_argument("--top-k", type=int, default=0, help="Top-k sampling (0 disables)")
+parser.add_argument("--top-p", type=float, default=0.0, help="Top-p sampling (0 disables)")
+parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Penalty for previously seen tokens")
+parser.add_argument("--stop-on-user-start", action="store_true", help="Stop if generation begins the next user turn")
 args = parser.parse_args()
 
 from microchat.chat_eval import default_eval_path, evaluate_response, load_eval_cases, summarize_results
@@ -38,7 +41,11 @@ def build_prompt_tokens(tokenizer, prompt: str) -> list[int]:
 
 def generate_response(engine, tokenizer, prompt: str) -> str:
     assistant_end = tokenizer.encode_special("<|assistant_end|>")
+    user_start = tokenizer.encode_special("<|user_start|>")
     tokens = build_prompt_tokens(tokenizer, prompt)
+    stop_token_ids = [assistant_end]
+    if args.stop_on_user_start:
+        stop_token_ids.append(user_start)
     generated = []
     for token_column, _ in engine.generate(
         tokens,
@@ -46,9 +53,12 @@ def generate_response(engine, tokenizer, prompt: str) -> str:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=(args.top_k or None),
+        top_p=(args.top_p or None),
+        repetition_penalty=args.repetition_penalty,
+        stop_token_ids=stop_token_ids,
     ):
         token = token_column[0]
-        if token == assistant_end:
+        if token in stop_token_ids:
             break
         generated.append(token)
     return tokenizer.decode(generated).strip()

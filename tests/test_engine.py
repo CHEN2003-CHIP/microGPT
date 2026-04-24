@@ -5,7 +5,7 @@ python -m pytest tests/test_engine.py -v
 """
 
 import torch
-from microchat.engine import KVCache, Engine
+from microchat.engine import KVCache, Engine, sample_next_token
 from dataclasses import dataclass
 
 
@@ -44,6 +44,22 @@ class MockModel:
             kv_cache.advance(T)
         # Uniform logits -> equal probability for all tokens
         logits = torch.zeros(B, T, self.vocab_size)
+        return logits
+
+
+class PreferredTokenModel(MockModel):
+    def __init__(self, preferred_token, fallback_token=65, vocab_size=262):
+        super().__init__(vocab_size=vocab_size)
+        self.preferred_token = preferred_token
+        self.fallback_token = fallback_token
+
+    def forward(self, ids, kv_cache=None):
+        B, T = ids.shape
+        if kv_cache is not None:
+            kv_cache.advance(T)
+        logits = torch.full((B, T, self.vocab_size), -10.0)
+        logits[:, :, self.fallback_token] = 5.0
+        logits[:, :, self.preferred_token] = 10.0
         return logits
 
 
@@ -265,3 +281,40 @@ def test_different_seeds_introduce_variation_when_temperature_nonzero():
 
     # Sanity check: sampling actually introduces variation
     assert len(outputs) > 1, "All seeds produced the same output which is statistically highly improbable."
+
+
+def test_stop_token_ids_end_generation():
+    stop_token = 77
+    model = PreferredTokenModel(preferred_token=stop_token)
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72]
+
+    results, _ = engine.generate_batch(prompt, max_tokens=4, stop_token_ids=[stop_token], temperature=0.0)
+    assert results[0] == prompt
+
+
+def test_repetition_penalty_changes_greedy_choice():
+    preferred_token = 65
+    fallback_token = 66
+    model = PreferredTokenModel(preferred_token=preferred_token, fallback_token=fallback_token)
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, preferred_token]
+
+    without_penalty, _ = engine.generate_batch(prompt, max_tokens=1, temperature=0.0)
+    with_penalty, _ = engine.generate_batch(
+        prompt,
+        max_tokens=1,
+        temperature=0.0,
+        repetition_penalty=3.0,
+    )
+
+    assert without_penalty[0][-1] == preferred_token
+    assert with_penalty[0][-1] == fallback_token
+
+
+def test_top_p_can_restrict_tail_tokens():
+    logits = torch.tensor([[5.0, 4.0, -5.0]])
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(123)
+    sampled = sample_next_token(logits, rng, temperature=1.0, top_p=0.5)
+    assert sampled.item() == 0

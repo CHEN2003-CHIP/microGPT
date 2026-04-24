@@ -385,6 +385,28 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    @staticmethod
+    def _is_behavior_param(name):
+        behavior_markers = (
+            "smear_gate",
+            "smear_lambda",
+            "resid_lambdas",
+            "x0_lambdas",
+            "backout_lambda",
+            "value_embeds",
+            "ve_gate",
+        )
+        return any(marker in name for marker in behavior_markers)
+
+    @staticmethod
+    def _is_no_decay_param(name, param):
+        return (
+            param.ndim < 2
+            or "transformer.wte" in name
+            or "value_embeds" in name
+            or "lm_head" in name
+        )
+
     def setup_optimizer(self, lr=3e-4, weight_decay=0.01):
         muon_params = []
         adamw_decay_params = []
@@ -417,6 +439,62 @@ class GPT(nn.Module):
             **adamw_kwargs,
         )
         return CombinedOptimizer(muon, adamw)
+
+    def setup_sft_optimizer(
+        self,
+        lr=2e-5,
+        weight_decay=0.01,
+        optimizer_type="adamw_full",
+        behavior_lr_scale=0.2,
+    ):
+        decay_params = []
+        no_decay_params = []
+        behavior_decay_params = []
+        behavior_no_decay_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_behavior = self._is_behavior_param(name)
+            is_no_decay = self._is_no_decay_param(name, param)
+
+            if is_behavior and optimizer_type == "adamw_behavior_low_lr":
+                if is_no_decay:
+                    behavior_no_decay_params.append(param)
+                else:
+                    behavior_decay_params.append(param)
+                continue
+
+            if is_no_decay:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = [
+            {"params": decay_params, "weight_decay": weight_decay, "lr_scale": 1.0},
+            {"params": no_decay_params, "weight_decay": 0.0, "lr_scale": 1.0},
+        ]
+        if optimizer_type == "adamw_behavior_low_lr":
+            param_groups.extend(
+                [
+                    {
+                        "params": behavior_decay_params,
+                        "weight_decay": weight_decay,
+                        "lr_scale": behavior_lr_scale,
+                    },
+                    {
+                        "params": behavior_no_decay_params,
+                        "weight_decay": 0.0,
+                        "lr_scale": behavior_lr_scale,
+                    },
+                ]
+            )
+
+        param_groups = [group for group in param_groups if group["params"]]
+        adamw_kwargs = {"lr": lr, "betas": (0.9, 0.95)}
+        if "fused" in inspect.signature(torch.optim.AdamW).parameters:
+            adamw_kwargs["fused"] = self.get_device().type == "cuda"
+        return torch.optim.AdamW(param_groups, **adamw_kwargs)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
         _, seq_len = idx.size()
