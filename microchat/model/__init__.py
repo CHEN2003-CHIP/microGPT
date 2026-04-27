@@ -1,24 +1,15 @@
-"""Backward-compatible GPT imports.
+"""Structured model package for microGPT."""
 
-The implementation lives in :mod:`microchat.model`; this module preserves the
-original public import path used by scripts and checkpoints.
-"""
-
-from microchat.model import (
-    Block,
+from microchat.model.attention import (
     CausalSelfAttention,
-    CombinedOptimizer,
-    GPT,
-    GPTConfig,
-    Linear,
-    MLP,
-    Muon,
     apply_rotary_emb,
     build_sliding_mask,
-    has_ve,
-    norm,
     repeat_kv_heads,
 )
+from microchat.model.config import GPTConfig
+from microchat.model.gpt import GPT
+from microchat.model.layers import Block, Linear, MLP, has_ve, norm
+from microchat.model.optim import CombinedOptimizer, Muon
 
 __all__ = [
     "GPT",
