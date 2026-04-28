@@ -60,10 +60,12 @@ class CausalSelfAttention(nn.Module):
 
     def _scaled_attention(self, q, k, v, window_size, kv_cache):
         q = q.transpose(1, 2)
-        k = repeat_kv_heads(k.transpose(1, 2), self.n_head)  #(batch_size, n_head, seq_len, head_dim)
-        v = repeat_kv_heads(v.transpose(1, 2), self.n_head)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         if kv_cache is None:
+            k = repeat_kv_heads(k, self.n_head)
+            v = repeat_kv_heads(v, self.n_head)
             if window_size < 0 or window_size >= q.size(-2):
                 return F.scaled_dot_product_attention(q, k, v, is_causal=True)
             query_positions = torch.arange(q.size(-2), device=q.device)
@@ -73,7 +75,7 @@ class CausalSelfAttention(nn.Module):
         cache_position = kv_cache.get_pos()
         key_cache, value_cache = kv_cache.get_layer_cache(self.layer_idx)
         current_length = q.size(-2)
-        key_cache[:, cache_position:cache_position + current_length] = k.transpose(1, 2) #(batch_size, seq_len,n_head, head_dim)
+        key_cache[:, cache_position:cache_position + current_length] = k.transpose(1, 2)
         value_cache[:, cache_position:cache_position + current_length] = v.transpose(1, 2)
         key_length = cache_position + current_length
 

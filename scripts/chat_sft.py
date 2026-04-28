@@ -302,7 +302,7 @@ def render_markdown_report(path: str, *, model_tag: str, summary: dict, history:
     ]
     if history:
         lines.extend(["## Latest Metrics", ""])
-        for key in ("step", "lr", "train_loss_ema", "val_bpb", "tokens_seen", "tok_per_sec"):
+        for key in ("step", "lr", "train_loss_ema", "val_bpb", "tokens_seen", "supervised_tokens", "tok_per_sec"):
             if key in last_metric:
                 lines.append(f"- {key}: `{last_metric[key]}`")
     with open(path, "w", encoding="utf-8") as handle:
@@ -364,20 +364,26 @@ def maybe_resume(model, optimizer, checkpoint_dir, device):
 
 
 def train():
+    #选择运行设备
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _, _, _, _, device = compute_init(device_type)
+    #load model and tokenizer
     model, tokenizer, metadata = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+    #获取token字节数以便正确计算bpb
     token_bytes = get_token_bytes(device=device)
+    #设置优化器
     optimizer = model.setup_sft_optimizer(
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         optimizer_type=args.sft_optimizer,
         behavior_lr_scale=args.behavior_lr_scale,
     )
-
+    #获取sft目录
     checkpoint_dir = get_sft_checkpoint_dir()
+    #maybe resume from checkpoint
     start_step, best_val_bpb, tokens_seen, history = maybe_resume(model, optimizer, checkpoint_dir, device)
 
+    #获取base模型的训练数据集和验证数据集
     base_dir = get_base_dir()
     train_dataset, val_dataset, dataset_label = build_sft_datasets(base_dir)
     train_loader = build_sft_loader(
@@ -396,12 +402,17 @@ def train():
         device,
         pack_conversations=args.pack_conversations,
     )
-
+    #一次forward和backward的token数量
     tokens_per_micro_step = args.device_batch_size * args.max_seq_len
+
     assert args.total_batch_size % tokens_per_micro_step == 0, "total_batch_size must divide into micro-steps"
+    #计算梯度累积步数以达到目标总批量大小
     grad_accum_steps = args.total_batch_size // tokens_per_micro_step
+    #每grad_accum_steps个step更新一次模型参数,更新了多少token
     tokens_per_step = grad_accum_steps * tokens_per_micro_step
+    #计算训练总步数
     target_steps = estimate_total_steps(tokens_per_step)
+    #最后的训练步数取用户指定的迭代次数和token预算计算出的步数中的较大者，确保至少训练用户指定的迭代次数
     final_step = max(args.num_iterations, start_step)
     if args.max_train_tokens > 0:
         final_step = max(final_step, target_steps)
@@ -414,15 +425,18 @@ def train():
     print0(f"Tokens per optimizer step: {tokens_per_step}")
     print0(f"Target training steps: {final_step}")
 
+
     current_inputs, current_targets = next(train_loader)
     ema_loss = 0.0
     ema_beta = 0.9
+    ema_count = 0
     started = time.time()
     metrics_path, report_path = get_report_paths()
 
     if start_step == 0 and os.path.exists(metrics_path):
         os.remove(metrics_path)
 
+    #训练主循环
     step = start_step
     while step < final_step:
         if args.max_train_tokens > 0 and tokens_seen >= args.max_train_tokens:
@@ -430,6 +444,7 @@ def train():
         step += 1
         model.train()
         step_loss = 0.0
+        supervised_tokens_this_step = 0
         step_started = time.time()
         lr = compute_learning_rate(step, final_step)
         set_optimizer_lr(optimizer, lr)
@@ -442,8 +457,9 @@ def train():
                     "This usually means the batch had no supervised assistant targets "
                     "or the optimization became numerically unstable."
                 )
-            step_loss += loss.item()
+            step_loss += loss.item() / grad_accum_steps
             (loss / grad_accum_steps).backward()
+            supervised_tokens_this_step += int((current_targets != -1).sum().item())
             current_inputs, current_targets = next(train_loader)
 
         grad_norm = None
@@ -452,8 +468,9 @@ def train():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        ema_count += 1
         ema_loss = ema_beta * ema_loss + (1 - ema_beta) * step_loss
-        smooth_loss = ema_loss / (1 - ema_beta ** step)
+        smooth_loss = ema_loss / (1 - ema_beta ** ema_count)
         tokens_seen += tokens_per_step
         step_elapsed = max(time.time() - step_started, 1e-6)
         tok_per_sec = tokens_per_step / step_elapsed
@@ -463,6 +480,7 @@ def train():
             "lr": round(lr, 10),
             "train_loss_ema": round(float(smooth_loss), 6),
             "tokens_seen": int(tokens_seen),
+            "supervised_tokens": supervised_tokens_this_step,
             "tok_per_sec": round(tok_per_sec, 2),
         }
         if grad_norm is not None:
@@ -489,11 +507,12 @@ def train():
         append_metric(metrics_path, metric)
 
         if args.save_every > 0 and step % args.save_every == 0:
+            checkpoint_val_bpb = metric["val_bpb"] if metric["val_bpb"] is not None else best_val_bpb
             save_training_checkpoint(
                 model,
                 optimizer,
                 step,
-                metric["val_bpb"],
+                checkpoint_val_bpb,
                 best_val_bpb,
                 tokens_seen,
                 history,
