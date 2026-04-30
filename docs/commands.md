@@ -108,6 +108,15 @@ Important parameters:
 - `--model-tag`: checkpoint folder name.
 - `--resume`: resume the latest checkpoint for the selected tag.
 - `--standard-gpt-block`: disables experimental residual/value-embedding paths.
+- `--ffn-type`: feed-forward layer type, `dense` by default or `moe` for Mini-MoE.
+- `--num-experts`, `--moe-top-k`, `--moe-aux-loss-weight`: Mini-MoE routing and aux-loss controls.
+- `--no-shared-expert`: disables the shared expert in Mini-MoE mode.
+
+Mini-MoE smoke run:
+
+```bash
+python scripts/base_train.py --device-type cpu --ffn-type moe --num-experts 4 --moe-top-k 2 --num-iterations 1 --eval-every 1 --eval-tokens 256 --device-batch-size 1 --total-batch-size 256 --max-seq-len 256
+```
 
 Outputs:
 
@@ -228,11 +237,18 @@ KV cache generation benchmark:
 python experiments/kv_cache_generation.py --device-type cpu --n-layer 2 --n-head 4 --n-kv-head 2 --n-embd 128 --max-seq-len 24 --prompt-len 16 --new-tokens 8 --warmup-runs 1 --runs 2
 ```
 
+Mini-MoE router stats:
+
+```bash
+python experiments/moe_router_stats.py --device-type cpu --n-layer 2 --n-head 2 --n-kv-head 2 --n-embd 64 --seq-len 8 --batch-size 2 --num-experts 4 --moe-top-k 2
+```
+
 Important parameters:
 
 - `--n-head`: query heads.
 - `--n-kv-head`: KV heads for generation benchmark.
 - `--n-kv-heads`: KV head list for memory estimate.
+- `--num-experts`, `--moe-top-k`: Mini-MoE router shape for router stats.
 - `--max-seq-len`: cache/model capacity for generation benchmark.
 - `--prompt-len`, `--new-tokens`: measured generation shape.
 - `--report-dir`: custom report directory.
@@ -246,4 +262,7 @@ Reports:
 .microchat/reports/experiments/kv_cache_generation.json
 .microchat/reports/experiments/kv_cache_generation.md
 .microchat/reports/experiments/kv_cache_generation.csv
+.microchat/reports/experiments/moe_router_stats.json
+.microchat/reports/experiments/moe_router_stats.md
+.microchat/reports/experiments/moe_router_stats.csv
 ```

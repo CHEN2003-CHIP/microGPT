@@ -15,3 +15,8 @@ class GPTConfig:
     n_embd: int = 256
     window_pattern: str = "L"
     standard_gpt_block: bool = False
+    ffn_type: str = "dense"
+    num_experts: int = 4
+    moe_top_k: int = 2
+    moe_aux_loss_weight: float = 0.01
+    use_shared_expert: bool = True

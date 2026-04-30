@@ -41,6 +41,11 @@ parser.add_argument("--save-every", type=int, default=0, help="Save a checkpoint
 parser.add_argument("--resume", action="store_true", help="Resume the latest checkpoint for the selected model tag")
 parser.add_argument("--model-tag", type=str, default=None, help="Checkpoint directory name")
 parser.add_argument("--standard-gpt-block", action="store_true", help="Disable experimental residual/value-embedding paths")
+parser.add_argument("--ffn-type", type=str, default="dense", choices=["dense", "moe"], help="Feed-forward layer type")
+parser.add_argument("--num-experts", type=int, default=4, help="Number of MoE experts when --ffn-type moe")
+parser.add_argument("--moe-top-k", type=int, default=2, help="Number of routed experts per token in MoE mode")
+parser.add_argument("--moe-aux-loss-weight", type=float, default=0.01, help="MoE load-balance loss weight")
+parser.add_argument("--no-shared-expert", action="store_true", help="Disable the shared expert in MoE mode")
 args = parser.parse_args()
 
 import torch
@@ -84,6 +89,11 @@ def build_model_config(tokenizer):
         n_embd=model_dim,
         window_pattern=args.window_pattern,
         standard_gpt_block=args.standard_gpt_block,
+        ffn_type=args.ffn_type,
+        num_experts=args.num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
+        use_shared_expert=not args.no_shared_expert,
     )
 
 

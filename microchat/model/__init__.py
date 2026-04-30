@@ -8,7 +8,7 @@ from microchat.model.attention import (
 )
 from microchat.model.config import GPTConfig
 from microchat.model.gpt import GPT
-from microchat.model.layers import Block, Linear, MLP, has_ve, norm
+from microchat.model.layers import Block, Linear, MiniMoE, MLP, has_ve, norm
 from microchat.model.optim import CombinedOptimizer, Muon
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "Block",
     "CausalSelfAttention",
     "MLP",
+    "MiniMoE",
     "Linear",
     "Muon",
     "CombinedOptimizer",

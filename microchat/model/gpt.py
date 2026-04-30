@@ -47,6 +47,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self.latest_ce_loss = None
+        self.latest_moe_aux_loss = None
+        self.latest_total_loss = None
 
     @torch.no_grad()
     def init_weights(self):
@@ -61,8 +64,14 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -scale, scale)
             torch.nn.init.uniform_(block.attn.c_v.weight, -scale, scale)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -scale * 0.4, scale * 0.4)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if hasattr(block, "mlp"):
+                self._init_mlp(block.mlp, scale)
+            else:
+                torch.nn.init.uniform_(block.moe.router.weight, -scale, scale)
+                for expert in block.moe.experts:
+                    self._init_mlp(expert, scale)
+                if block.moe.shared_expert is not None:
+                    self._init_mlp(block.moe.shared_expert, scale)
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
         for layer_idx in range(self.config.n_layer):
@@ -81,6 +90,11 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for value_embedding in self.value_embeds.values():
                 value_embedding.to(dtype=COMPUTE_DTYPE)
+
+    @staticmethod
+    def _init_mlp(mlp, scale):
+        torch.nn.init.uniform_(mlp.c_fc.weight, -scale * 0.4, scale * 0.4)
+        torch.nn.init.zeros_(mlp.c_proj.weight)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         """Precompute cosine and sine values for rotary embeddings."""
@@ -106,6 +120,50 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def reset_moe_stats(self):
+        for block in self.transformer.h:
+            if hasattr(block, "moe"):
+                block.moe.reset_stats()
+
+    def get_moe_aux_loss(self):
+        aux_losses = [
+            block.moe.latest_aux_loss
+            for block in self.transformer.h
+            if hasattr(block, "moe") and block.moe.latest_aux_loss is not None
+        ]
+        if not aux_losses:
+            return torch.zeros((), device=self.get_device())
+        return torch.stack(aux_losses).sum()
+
+    def get_moe_stats(self, reset=False):
+        layer_stats = []
+        total_assignments = 0
+        total_tokens = 0
+        aux_losses = []
+        for layer_idx, block in enumerate(self.transformer.h):
+            if not hasattr(block, "moe") or block.moe.latest_stats is None:
+                continue
+            stats = dict(block.moe.latest_stats)
+            stats["layer_idx"] = layer_idx
+            layer_stats.append(stats)
+            total_assignments += stats["total_assignments"]
+            total_tokens += stats["num_tokens"]
+            aux_losses.append(stats["aux_loss"])
+        payload = {
+            "ffn_type": self.config.ffn_type,
+            "num_layers": len(layer_stats),
+            "num_experts": self.config.num_experts,
+            "top_k": self.config.moe_top_k,
+            "use_shared_expert": self.config.use_shared_expert,
+            "total_tokens": total_tokens,
+            "total_assignments": total_assignments,
+            "aux_loss": float(sum(aux_losses)),
+            "layers": layer_stats,
+        }
+        if reset:
+            self.reset_moe_stats()
+        return payload
 
     @staticmethod
     def _is_behavior_param(name):
@@ -219,6 +277,8 @@ class GPT(nn.Module):
         return torch.optim.AdamW(param_groups, **adamw_kwargs)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+        if self.config.ffn_type == "moe":
+            self.reset_moe_stats()
         _, seq_len = idx.size()
         start = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, start:start + seq_len], self.sin[:, start:start + seq_len]
@@ -257,13 +317,20 @@ class GPT(nn.Module):
 
         if targets is None:
             return logits
-        loss = F.cross_entropy(
+        ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
             reduction=loss_reduction,
         )
-        return loss
+        total_loss = ce_loss
+        moe_aux_loss = self.get_moe_aux_loss()
+        if self.config.ffn_type == "moe" and self.training and loss_reduction == "mean":
+            total_loss = ce_loss + self.config.moe_aux_loss_weight * moe_aux_loss
+        self.latest_ce_loss = ce_loss.detach()
+        self.latest_moe_aux_loss = moe_aux_loss.detach()
+        self.latest_total_loss = total_loss.detach()
+        return total_loss
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
